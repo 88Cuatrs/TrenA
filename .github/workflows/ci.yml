@@ -1,0 +1,168 @@
+name: lexer-and-arino-il-ci
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Verify native binaries and Ariño frontend/IL v2
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - name: Verify native x86-64 ELF files
+        run: |
+          set -euxo pipefail
+          file libarino_lexer.so | grep -F 'ELF 64-bit LSB shared object, x86-64'
+          file arino_lexer_tests | grep -F 'ELF 64-bit LSB pie executable, x86-64'
+          file arino_vm | grep -F 'ELF 64-bit LSB executable, x86-64'
+          file arino_ast_compiler | grep -F 'ELF 64-bit LSB executable, x86-64'
+          file arino_ast_compiler_core | grep -F 'ELF 64-bit LSB executable, x86-64'
+          chmod +x arino_vm arino_ast_compiler arino_ast_compiler_core arino_ast_compiler_scalar
+      - name: Run lexer tests
+        run: ./arino_lexer_tests
+      - name: Test AST, Spanish aliases, semantics and emitted IL
+        shell: bash
+        run: |
+          set -euo pipefail
+          tmp="$(mktemp -d)"
+          trap 'rm -rf "$tmp"' EXIT
+          compile_run() {
+            local name="$1" source="$2" expected="$3"
+            printf '%s' "$source" > "$tmp/$name.ari"
+            ./arino_ast_compiler --compile "$tmp/$name.ari" "$tmp/$name.arino"
+            ./arino_vm --verify "$tmp/$name.arino" | grep -F "OK ARINO 2.0"
+            local actual
+            actual="$(./arino_vm --run "$tmp/$name.arino")"
+            printf '%s => %s\n' "$source" "$actual"
+            test "$actual" = "$expected"
+          }
+          printf '%s' 'sumar 2 y 3' > "$tmp/ast.ari"
+          ./arino_ast_compiler --ast "$tmp/ast.ari" | grep -F '0001 PROGRAM'
+          ./arino_ast_compiler --ast "$tmp/ast.ari" | grep -F '0010 ADD'
+          ./arino_ast_compiler --check "$tmp/ast.ari"
+
+          # Todas las formas documentadas se normalizan a los cuatro operadores.
+          compile_run add-sumar 'sumar 2 y 3' 'RESULT I64(5)'
+          compile_run add-anadir 'añadir 2 y 3' 'RESULT I64(5)'
+          compile_run add-adicionar 'adicionar 2 y 3' 'RESULT I64(5)'
+          compile_run add-mas-acento '2 más 3' 'RESULT I64(5)'
+          compile_run add-mas-ascii '2 mas 3' 'RESULT I64(5)'
+          compile_run sub-restar 'restar 7 y 2' 'RESULT I64(5)'
+          compile_run sub-quitar 'quitar 7 y 2' 'RESULT I64(5)'
+          compile_run sub-sustraer 'sustraer 7 y 2' 'RESULT I64(5)'
+          compile_run sub-menos '7 menos 2' 'RESULT I64(5)'
+          compile_run mul-multiplicar 'multiplicar 2 y 3' 'RESULT I64(6)'
+          compile_run mul-por '2 por 3' 'RESULT I64(6)'
+          compile_run mul-veces '3 veces 2' 'RESULT I64(6)'
+          compile_run div-dividir 'dividir 8 y 2' 'RESULT I64(4)'
+          compile_run div-entre '8 entre 2' 'RESULT I64(4)'
+          compile_run div-partido '8 partido 2' 'RESULT I64(4)'
+          compile_run div-con 'dividir 8 con 2' 'RESULT I64(4)'
+
+          compile_run locals 'x = 7; y = x por 2; y menos 3' 'RESULT I64(11)'
+          ./arino_ast_compiler --compile "$tmp/locals.ari" "$tmp/locals.arino" | grep -F 'locals=2'
+          ./arino_vm --disasm "$tmp/locals.arino" | grep -F 'STORE        0'
+          ./arino_vm --disasm "$tmp/locals.arino" | grep -F 'STORE        1'
+          compile_run f64 '0.5 más 1.25' 'RESULT F64(1.75)'
+          compile_run folded '(2 más 3) por 4' 'RESULT I64(20)'
+          disasm="$(./arino_vm --disasm "$tmp/folded.arino")"
+          grep -F 'PUSH_I64     20' <<< "$disasm"
+          test "$(grep -c 'PUSH_I64' <<< "$disasm")" -eq 1
+          test "$(grep -c 'HALT' <<< "$disasm")" -eq 1
+
+          expect_reject() {
+            local source="$1"
+            printf '%s' "$source" > "$tmp/invalid.ari"
+            if ./arino_ast_compiler --check "$tmp/invalid.ari" >"$tmp/invalid.log" 2>&1; then
+              echo "expected semantic rejection: $source" >&2
+              exit 1
+            fi
+            cat "$tmp/invalid.log"
+          }
+          expect_reject 'x más 2'
+          expect_reject '1 más 2.0'
+          expect_reject 'x = 3; x = 2.0'
+      - name: Validate Spanish AI grammar, typed HIR and backend rejection
+        run: bash tests/test_ai_semantics.sh
+      - name: Validate native extended parser grammar, AST and recovery
+        run: bash tests/test_parser_extended.sh
+      - name: Verify preserved scalar compiler fallback binary
+        run: file arino_ast_compiler_scalar | grep -F 'ELF 64-bit LSB executable, x86-64'
+      - name: Verify and execute valid IL fixtures
+        shell: bash
+        run: |
+          set -euo pipefail
+          check() {
+            local fixture="$1" expected="$2" actual verified
+            verified="$(./arino_vm --verify "$fixture")"
+            grep -F "OK ARINO 2.0" <<<"$verified"
+            actual="$(./arino_vm --run "$fixture")"
+            printf '%s\n' "$actual"
+            test "$actual" = "$expected"
+          }
+          check arino_il_demo.arino 'RESULT I64(3)'
+          check arino_il_loop.arino 'RESULT I64(10)'
+          check arino_il_stack.arino 'RESULT I64(5)'
+          check arino_il_branch.arino 'RESULT I64(1)'
+          check arino_il_float.arino 'RESULT I64(1)'
+          check arino_il_constants.arino 'RESULT I64(84)'
+          check arino_il_f64_imm.arino 'RESULT F64(4)'
+          check arino_il_div_i64.arino 'RESULT I64(5)'
+          ./arino_vm --disasm arino_il_demo.arino | grep -F 'ADD_I64'
+          ./arino_vm --trace arino_il_demo.arino | grep -F 'RESULT I64(3)'
+          # Legacy format v1 stays readable, regardless of the filename suffix.
+          ./arino_vm --verify arino_il_v1_legacy.arino | grep -F 'OK ARIL 1.0'
+          ./arino_vm --run arino_il_v1_legacy.arino | grep -F 'RESULT I64(3)'
+          legacy="${RUNNER_TEMP:-/tmp}/arino-legacy-compat.aril"
+          cp arino_il_v1_legacy.arino "$legacy"
+          ./arino_vm --verify "$legacy" | grep -F 'OK ARIL 1.0'
+          ./arino_vm --run "$legacy" | grep -F 'RESULT I64(3)'
+      - name: Reject malformed IL fixtures
+        shell: bash
+        run: |
+          set -euo pipefail
+          for fixture in arino_il_bad_jump.arino arino_il_bad_opcode.arino arino_il_truncated.arino; do
+            if ./arino_vm --verify "$fixture"; then
+              echo "expected verifier rejection: $fixture" >&2
+              exit 1
+            fi
+          done
+      - name: Check expected runtime traps and instruction limit
+        shell: bash
+        run: |
+          set -euo pipefail
+          expect_trap() {
+            local fixture="$1" expected="$2"; shift 2
+            local output
+            if output="$(./arino_vm "$@" "$fixture" 2>&1)"; then
+              echo "expected runtime trap: $fixture" >&2
+              exit 1
+            fi
+            printf '%s\n' "$output"
+            grep -F "$expected" <<<"$output"
+          }
+          expect_trap arino_il_div0.arino 'division by zero' --run
+          expect_trap arino_il_underflow.arino 'requires two stack values' --run
+          expect_trap arino_il_type_error.arino 'type mismatch' --run
+          expect_trap arino_il_overflow.arino 'addition overflow' --run
+          expect_trap arino_il_infinite.arino 'instruction limit exceeded' --max-steps 20
+      - name: Publish Ariño native and IL artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: arino-vm-native-and-il-v2-linux-x86_64
+          path: |
+            libarino_lexer.so
+            arino_lexer_tests
+            arino_ast_compiler
+            arino_ast_compiler_core
+            arino_ast_compiler_scalar
+            arino_vm
+            arino_il_*.arino
+            arino_*.arino
+          if-no-files-found: error
